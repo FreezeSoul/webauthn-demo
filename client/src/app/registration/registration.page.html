@@ -31,6 +31,12 @@
 
     <div class="card bg-base-100 shadow-sm">
       <div class="card-body gap-5">
+        @if (!passkeySupported) {
+          <div role="alert" class="alert alert-warning text-sm">
+            This browser does not expose the WebAuthn APIs required for passkeys.
+          </div>
+        }
+
         @if (view() === 'new') {
           <form [formRoot]="newRegistrationForm" class="flex flex-col gap-5">
             <label class="form-control w-full gap-2">
@@ -50,7 +56,7 @@
             </label>
 
             <button
-              [disabled]="newRegistrationForm().submitting()"
+              [disabled]="newRegistrationForm().submitting() || !passkeySupported"
               class="btn btn-secondary btn-block"
               type="submit"
             >
@@ -64,6 +70,9 @@
 
         @if (view() === 'recover') {
           <form [formRoot]="recoveryRegistrationForm" class="flex flex-col gap-5">
+            <div role="alert" class="alert alert-warning text-sm">
+              Recovery replaces the account's existing passkey and recovery code.
+            </div>
             <label class="form-control w-full gap-2">
               <span class="label-text">Recovery Code</span>
               <input
@@ -80,14 +89,14 @@
             </label>
 
             <button
-              [disabled]="recoveryRegistrationForm().submitting()"
+              [disabled]="recoveryRegistrationForm().submitting() || !passkeySupported"
               class="btn btn-secondary btn-block"
               type="submit"
             >
               @if (recoveryRegistrationForm().submitting()) {
                 <span class="loading loading-spinner loading-sm"></span>
               }
-              Register
+              Recover access
             </button>
           </form>
         }
@@ -106,7 +115,12 @@
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body gap-4 text-center">
           <p class="font-medium">Your new recovery code:</p>
-          <code class="rounded bg-base-200 px-3 py-2 text-lg font-bold">{{ recoveryToken() }}</code>
+          <code class="break-all rounded bg-base-200 px-3 py-2 text-lg font-bold">{{
+            recoveryToken()
+          }}</code>
+          <button (click)="copyRecoveryCode()" class="btn btn-outline btn-sm" type="button">
+            {{ recoveryCodeCopied() ? 'Copied' : 'Copy recovery code' }}
+          </button>
           <p class="text-sm text-base-content/70">
             If you ever need to recover access to your account, you need this code. You should print
             it or write it down, and store it in a safe place. We strongly recommend that you don't

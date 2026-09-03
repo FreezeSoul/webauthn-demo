@@ -1,7 +1,9 @@
 import { httpResource } from '@angular/common/http';
 import { Component, inject } from '@angular/core';
 import { Router } from '@angular/router';
+import { firstValueFrom } from 'rxjs';
 import { AuthService } from '../auth.service';
+import { MessagesService } from '../messages.service';
 
 @Component({
   selector: 'app-home',
@@ -13,8 +15,17 @@ export class HomePage {
 
   private readonly authService = inject(AuthService);
   private readonly router = inject(Router);
+  private readonly messagesService = inject(MessagesService);
 
   async logout(): Promise<void> {
-    this.authService.logout().subscribe(() => this.router.navigateByUrl('/login'));
+    const loading = await this.messagesService.showLoading('Signing out ...');
+    try {
+      await firstValueFrom(this.authService.logout());
+      await this.router.navigateByUrl('/login', { replaceUrl: true });
+    } catch {
+      await this.messagesService.showErrorToast('Logout failed');
+    } finally {
+      await loading.dismiss();
+    }
   }
 }

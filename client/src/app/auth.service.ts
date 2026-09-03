@@ -26,7 +26,7 @@ export class AuthService {
 
   logout(): Observable<void> {
     return this.httpClient
-      .get<void>('logout', {
+      .post<void>('logout', null, {
         withCredentials: true,
       })
       .pipe(tap(() => (this.loggedIn = false)));

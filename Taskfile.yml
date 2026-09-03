@@ -43,6 +43,12 @@ tasks:
     cmds:
       - '{{.MVNW}} -DskipTests package'
 
+  server:package:
+    desc: Package the server with the previously built client
+    dir: server
+    cmds:
+      - '{{.MVNW}} -Pproduction -DskipTests clean package'
+
   server:jooq:
     desc: Generate jOOQ classes from the running PostgreSQL database
     dir: server
@@ -80,10 +86,10 @@ tasks:
       - npm run format
 
   build:
-    desc: Build client and server
-    deps:
-      - client:build
-      - server:build
+    desc: Build the client and package the runnable application
+    cmds:
+      - task: client:build
+      - task: server:package
 
   verify:
     desc: Run lint/build checks

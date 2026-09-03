@@ -6,3 +6,8 @@ services:
       POSTGRES_PASSWORD: password
     ports:
       - "5432:5432"
+    volumes:
+      - wa_data:/var/lib/postgresql
+
+volumes:
+  wa_data:

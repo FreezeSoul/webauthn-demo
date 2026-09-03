@@ -15,4 +15,5 @@ export const routes: Routes = [
     path: 'registration',
     loadComponent: () => import('./registration/registration.page').then((m) => m.RegistrationPage),
   },
+  { path: '**', redirectTo: 'home' },
 ];

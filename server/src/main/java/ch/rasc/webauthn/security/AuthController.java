@@ -1,18 +1,20 @@
 package ch.rasc.webauthn.security;
 
 import java.security.SecureRandom;
-import java.time.Clock;
-import java.time.LocalDateTime;
 import java.util.Base64;
-import java.util.Optional;
-import java.util.SortedSet;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import org.jooq.DSLContext;
+import org.jooq.exception.DataAccessException;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.web.csrf.CsrfToken;
 import org.springframework.security.web.context.SecurityContextRepository;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -30,10 +32,8 @@ import com.yubico.webauthn.FinishRegistrationOptions;
 import com.yubico.webauthn.RegistrationResult;
 import com.yubico.webauthn.RelyingParty;
 import com.yubico.webauthn.StartAssertionOptions;
-import com.yubico.webauthn.StartAssertionOptions.StartAssertionOptionsBuilder;
 import com.yubico.webauthn.StartRegistrationOptions;
 import com.yubico.webauthn.data.AuthenticatorSelectionCriteria;
-import com.yubico.webauthn.data.AuthenticatorTransport;
 import com.yubico.webauthn.data.ByteArray;
 import com.yubico.webauthn.data.PublicKeyCredentialCreationOptions;
 import com.yubico.webauthn.data.ResidentKeyRequirement;
@@ -53,6 +53,8 @@ import ch.rasc.webauthn.security.dto.RegistrationStartResponse.Mode;
 import ch.rasc.webauthn.util.Base58;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpSession;
+import jakarta.validation.Valid;
 
 @RestController
 @Validated
@@ -60,8 +62,7 @@ public class AuthController {
 
   private final DSLContext dsl;
 
-  private final Cache<String, RegistrationStartResponse> registrationCache;
-  private final Cache<String, Long> registrationUserIdCache;
+  private final Cache<String, PendingRegistration> registrationCache;
 
   private final Cache<String, AssertionStartResponse> assertionCache;
 
@@ -71,24 +72,23 @@ public class AuthController {
 
   private final RelyingParty relyingParty;
 
+  private final TransactionTemplate transactionTemplate;
+
   private final SecureRandom random;
 
-  private final Clock clock;
-
   public AuthController(DSLContext dsl, JooqCredentialRepository credentialRepository,
-      RelyingParty relyingParty, SecurityContextRepository securityContextRepository) {
+      RelyingParty relyingParty, SecurityContextRepository securityContextRepository,
+      TransactionTemplate transactionTemplate) {
     this.dsl = dsl;
     this.credentialRepository = credentialRepository;
     this.securityContextRepository = securityContextRepository;
     this.relyingParty = relyingParty;
+    this.transactionTemplate = transactionTemplate;
     this.registrationCache = Caffeine.newBuilder().maximumSize(1000)
-        .expireAfterAccess(5, TimeUnit.MINUTES).build();
-    this.registrationUserIdCache = Caffeine.newBuilder().maximumSize(1000)
-        .expireAfterAccess(5, TimeUnit.MINUTES).build();
+        .expireAfterWrite(5, TimeUnit.MINUTES).build();
     this.assertionCache = Caffeine.newBuilder().maximumSize(1000)
-        .expireAfterAccess(5, TimeUnit.MINUTES).build();
+        .expireAfterWrite(5, TimeUnit.MINUTES).build();
     this.random = new SecureRandom();
-    this.clock = Clock.systemUTC();
   }
 
   @GetMapping("/authenticate")
@@ -97,48 +97,66 @@ public class AuthController {
     // nothing here
   }
 
+  @GetMapping("/csrf")
+  public CsrfToken csrf(CsrfToken csrfToken) {
+    return csrfToken;
+  }
+
   @PostMapping("/registration/start")
   public RegistrationStartResponse registrationStart(
       @RequestParam(name = "username", required = false) String username,
       @RequestParam(name = "recoveryToken", required = false) String recoveryToken) {
 
-    long userId = -1;
+    Long userId = null;
+    byte[] recoveryTokenBytes = null;
     String name = null;
     Mode mode = null;
 
-    if (username != null && !username.isEmpty()) {
-      // cancel if the user is already registered
+    String normalizedUsername = username == null ? null : username.strip();
+    String normalizedRecoveryToken = recoveryToken == null ? null
+        : recoveryToken.strip();
+    boolean hasUsername = normalizedUsername != null && !normalizedUsername.isEmpty();
+    boolean hasRecoveryToken = normalizedRecoveryToken != null
+        && !normalizedRecoveryToken.isEmpty();
+
+    if (hasUsername == hasRecoveryToken) {
+      return new RegistrationStartResponse(
+          RegistrationStartResponse.Status.INVALID_REQUEST);
+    }
+
+    if (hasUsername) {
+      if (normalizedUsername.length() > 255) {
+        return new RegistrationStartResponse(
+            RegistrationStartResponse.Status.INVALID_REQUEST);
+      }
+
       int count = this.dsl.selectCount().from(APP_USER)
-          .where(APP_USER.USERNAME.equalIgnoreCase(username)).fetchOne(0, int.class);
+          .where(APP_USER.USERNAME.equalIgnoreCase(normalizedUsername))
+          .fetchOne(0, int.class);
       if (count > 0) {
         return new RegistrationStartResponse(
             RegistrationStartResponse.Status.USERNAME_TAKEN);
       }
 
-      var insertedUser = this.dsl
-          .insertInto(APP_USER, APP_USER.USERNAME, APP_USER.REGISTRATION_START)
-          .values(username, LocalDateTime.now(this.clock)).returning(APP_USER.ID)
-          .fetchOne();
-      if (insertedUser == null) {
-        throw new IllegalStateException("Failed to create user");
-      }
-
-      userId = insertedUser.getId();
-      name = username;
+      name = normalizedUsername;
       mode = Mode.NEW;
     }
-    else if (recoveryToken != null && !recoveryToken.isEmpty()) {
-      byte[] recoveryTokenDecoded;
+    else {
       try {
-        recoveryTokenDecoded = Base58.decode(recoveryToken);
+        recoveryTokenBytes = Base58.decode(normalizedRecoveryToken);
       }
       catch (Exception e) {
         return new RegistrationStartResponse(
             RegistrationStartResponse.Status.TOKEN_INVALID);
       }
 
+      if (recoveryTokenBytes.length != 16) {
+        return new RegistrationStartResponse(
+            RegistrationStartResponse.Status.TOKEN_INVALID);
+      }
+
       var record = this.dsl.select(APP_USER.ID, APP_USER.USERNAME).from(APP_USER)
-          .where(APP_USER.RECOVERY_TOKEN.eq(recoveryTokenDecoded)).fetchOne();
+          .where(APP_USER.RECOVERY_TOKEN.eq(recoveryTokenBytes)).fetchOne();
 
       if (record == null) {
         return new RegistrationStartResponse(
@@ -150,114 +168,74 @@ public class AuthController {
       mode = Mode.RECOVERY;
     }
 
-    if (mode != null) {
-      byte[] webAuthnIdBytes = new byte[64];
-      this.random.nextBytes(webAuthnIdBytes);
-      ByteArray webAuthnId = new ByteArray(webAuthnIdBytes);
+    byte[] webAuthnIdBytes = new byte[64];
+    this.random.nextBytes(webAuthnIdBytes);
+    ByteArray webAuthnId = new ByteArray(webAuthnIdBytes);
 
-      PublicKeyCredentialCreationOptions credentialCreation = this.relyingParty
-          .startRegistration(StartRegistrationOptions.builder()
-              .user(UserIdentity.builder().name(name).displayName(name).id(webAuthnId)
-                  .build())
-              .authenticatorSelection(AuthenticatorSelectionCriteria.builder()
-                  .residentKey(ResidentKeyRequirement.REQUIRED)
-                  .userVerification(UserVerificationRequirement.PREFERRED).build())
-              .build());
+    PublicKeyCredentialCreationOptions credentialCreation = this.relyingParty
+        .startRegistration(StartRegistrationOptions.builder()
+            .user(UserIdentity.builder().name(name).displayName(name).id(webAuthnId)
+                .build())
+            .authenticatorSelection(AuthenticatorSelectionCriteria.builder()
+                .residentKey(ResidentKeyRequirement.REQUIRED)
+                .userVerification(UserVerificationRequirement.PREFERRED).build())
+            .build());
 
-      byte[] registrationId = new byte[16];
-      this.random.nextBytes(registrationId);
-      RegistrationStartResponse startResponse = new RegistrationStartResponse(mode,
-          Base64.getEncoder().encodeToString(registrationId), credentialCreation);
+    RegistrationStartResponse startResponse = new RegistrationStartResponse(mode,
+        newRequestId(), credentialCreation);
 
-      this.registrationCache.put(startResponse.getRegistrationId(), startResponse);
-      this.registrationUserIdCache.put(startResponse.getRegistrationId(), userId);
+    this.registrationCache.put(startResponse.getRegistrationId(),
+        new PendingRegistration(startResponse, userId,
+            recoveryTokenBytes == null ? null : new ByteArray(recoveryTokenBytes)));
 
-      return startResponse;
-    }
-
-    return null;
+    return startResponse;
   }
 
   @PostMapping("/registration/finish")
-  public String registrationFinish(@RequestBody RegistrationFinishRequest finishRequest) {
+  public ResponseEntity<String> registrationFinish(
+      @Valid @RequestBody RegistrationFinishRequest finishRequest) {
 
-    RegistrationStartResponse startResponse = this.registrationCache
-        .getIfPresent(finishRequest.getRegistrationId());
-    this.registrationCache.invalidate(finishRequest.getRegistrationId());
-    Long userId = this.registrationUserIdCache
-        .getIfPresent(finishRequest.getRegistrationId());
-    this.registrationUserIdCache.invalidate(finishRequest.getRegistrationId());
-
-    if (startResponse != null) {
-      try {
-        RegistrationResult registrationResult = this.relyingParty
-            .finishRegistration(FinishRegistrationOptions.builder()
-                .request(startResponse.getPublicKeyCredentialCreationOptions())
-                .response(finishRequest.getCredential()).build());
-
-        UserIdentity userIdentity = startResponse.getPublicKeyCredentialCreationOptions()
-            .getUser();
-
-        String transports = null;
-        Optional<SortedSet<AuthenticatorTransport>> transportOptional = registrationResult
-            .getKeyId().getTransports();
-        if (transportOptional.isPresent()) {
-          transports = "";
-          for (AuthenticatorTransport at : transportOptional.get()) {
-            if (transports.length() > 0) {
-              transports += ",";
-            }
-            transports += at.getId();
-          }
-        }
-        if (startResponse.getMode() == Mode.RECOVERY) {
-          this.dsl.deleteFrom(CREDENTIALS).where(CREDENTIALS.APP_USER_ID.eq(userId))
-              .execute();
-        }
-
-        this.credentialRepository.addCredential(userId, userIdentity.getId().getBytes(),
-            registrationResult.getKeyId().getId().getBytes(),
-            registrationResult.getPublicKeyCose().getBytes(), transports,
-            finishRequest.getCredential().getResponse().getParsedAuthenticatorData()
-                .getSignatureCounter());
-
-        if (startResponse.getMode() == Mode.NEW
-            || startResponse.getMode() == Mode.RECOVERY) {
-          byte[] recoveryToken = new byte[16];
-          this.random.nextBytes(recoveryToken);
-
-          this.dsl.update(APP_USER).set(APP_USER.REGISTRATION_START, (LocalDateTime) null)
-              .set(APP_USER.RECOVERY_TOKEN, recoveryToken).where(APP_USER.ID.eq(userId))
-              .execute();
-
-          return Base58.encode(recoveryToken);
-        }
-
-        return "OK";
-      }
-      catch (RegistrationFailedException e) {
-        Application.log.error("registration failed", e);
-      }
-    }
-    else {
-      Application.log.error("invalid registration finish request");
+    PendingRegistration pending = this.registrationCache.asMap()
+        .remove(finishRequest.getRegistrationId());
+    if (pending == null) {
+      Application.log.warn("Expired or already consumed registration request");
+      return ResponseEntity.badRequest().build();
     }
 
-    return null;
+    RegistrationResult registrationResult;
+    try {
+      registrationResult = this.relyingParty
+          .finishRegistration(FinishRegistrationOptions.builder()
+              .request(pending.startResponse()
+                  .getPublicKeyCredentialCreationOptions())
+              .response(finishRequest.getCredential()).build());
+    }
+    catch (RegistrationFailedException | IllegalArgumentException e) {
+      Application.log.warn("Registration verification failed: {}", e.getMessage());
+      return ResponseEntity.badRequest().build();
+    }
+
+    try {
+      String newRecoveryToken = this.transactionTemplate.execute(status ->
+          persistRegistration(pending, registrationResult, finishRequest));
+      if (newRecoveryToken == null) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).build();
+      }
+      return ResponseEntity.ok(newRecoveryToken);
+    }
+    catch (DataAccessException | org.springframework.dao.DataAccessException e) {
+      Application.log.warn("Could not persist registration: {}", e.getMessage());
+      return ResponseEntity.status(HttpStatus.CONFLICT).build();
+    }
   }
 
   @PostMapping("/assertion/start")
   public AssertionStartResponse start() {
-    byte[] assertionId = new byte[16];
-    this.random.nextBytes(assertionId);
-
-    String assertionIdBase64 = Base64.getEncoder().encodeToString(assertionId);
-    StartAssertionOptionsBuilder userVerificationBuilder = StartAssertionOptions.builder()
-        .userVerification(UserVerificationRequirement.PREFERRED);
     AssertionRequest assertionRequest = this.relyingParty
-        .startAssertion(userVerificationBuilder.build());
+        .startAssertion(StartAssertionOptions.builder()
+            .userVerification(UserVerificationRequirement.PREFERRED).build());
 
-    AssertionStartResponse response = new AssertionStartResponse(assertionIdBase64,
+    AssertionStartResponse response = new AssertionStartResponse(newRequestId(),
         assertionRequest);
 
     this.assertionCache.put(response.getAssertionId(), response);
@@ -265,15 +243,14 @@ public class AuthController {
   }
 
   @PostMapping("/assertion/finish")
-  public boolean finish(@RequestBody AssertionFinishRequest finishRequest,
+  public boolean finish(@Valid @RequestBody AssertionFinishRequest finishRequest,
       HttpServletRequest request, HttpServletResponse response) {
 
-    AssertionStartResponse startResponse = this.assertionCache
-        .getIfPresent(finishRequest.getAssertionId());
-    this.assertionCache.invalidate(finishRequest.getAssertionId());
+    AssertionStartResponse startResponse = this.assertionCache.asMap()
+        .remove(finishRequest.getAssertionId());
 
     if (startResponse == null) {
-      Application.log.error("invalid assertion finish request");
+      Application.log.warn("Expired or already consumed assertion request");
       return false;
     }
 
@@ -300,18 +277,81 @@ public class AuthController {
           AppUserDetail userDetail = new AppUserDetail(appUserRecord,
               new SimpleGrantedAuthority("USER"));
           AppUserAuthentication auth = new AppUserAuthentication(userDetail);
-          SecurityContextHolder.getContext().setAuthentication(auth);
-          this.securityContextRepository.saveContext(SecurityContextHolder.getContext(),
-              request, response);
+          HttpSession existingSession = request.getSession(false);
+          if (existingSession != null) {
+            request.changeSessionId();
+          }
+          SecurityContext context = SecurityContextHolder.createEmptyContext();
+          context.setAuthentication(auth);
+          SecurityContextHolder.setContext(context);
+          this.securityContextRepository.saveContext(context, request, response);
           return true;
         }
       }
     }
-    catch (AssertionFailedException e) {
-      Application.log.error("Assertion failed", e);
+    catch (AssertionFailedException | IllegalArgumentException e) {
+      Application.log.warn("Assertion verification failed: {}", e.getMessage());
     }
 
     return false;
+  }
+
+  private String persistRegistration(PendingRegistration pending,
+      RegistrationResult registrationResult,
+      RegistrationFinishRequest finishRequest) {
+    byte[] newRecoveryToken = new byte[16];
+    this.random.nextBytes(newRecoveryToken);
+
+    RegistrationStartResponse startResponse = pending.startResponse();
+    UserIdentity userIdentity = startResponse.getPublicKeyCredentialCreationOptions()
+        .getUser();
+
+    Long userId = pending.userId();
+    if (startResponse.getMode() == Mode.NEW) {
+      var insertedUser = this.dsl
+          .insertInto(APP_USER, APP_USER.USERNAME, APP_USER.RECOVERY_TOKEN)
+          .values(userIdentity.getName(), newRecoveryToken).returning(APP_USER.ID)
+          .fetchOne();
+      if (insertedUser == null) {
+        throw new IllegalStateException("Failed to create user");
+      }
+      userId = insertedUser.getId();
+    }
+    else {
+      int updated = this.dsl.update(APP_USER)
+          .set(APP_USER.RECOVERY_TOKEN, newRecoveryToken)
+          .where(APP_USER.ID.eq(userId)
+              .and(APP_USER.RECOVERY_TOKEN.eq(pending.recoveryToken().getBytes())))
+          .execute();
+      if (updated != 1) {
+        return null;
+      }
+      this.dsl.deleteFrom(CREDENTIALS).where(CREDENTIALS.APP_USER_ID.eq(userId))
+          .execute();
+    }
+
+    String transports = registrationResult.getKeyId().getTransports()
+        .map(values -> values.stream().map(transport -> transport.getId())
+            .collect(Collectors.joining(",")))
+        .filter(value -> !value.isEmpty()).orElse(null);
+
+    this.credentialRepository.addCredential(userId, userIdentity.getId().getBytes(),
+        registrationResult.getKeyId().getId().getBytes(),
+        registrationResult.getPublicKeyCose().getBytes(), transports,
+        finishRequest.getCredential().getResponse().getParsedAuthenticatorData()
+            .getSignatureCounter());
+
+    return Base58.encode(newRecoveryToken);
+  }
+
+  private String newRequestId() {
+    byte[] requestId = new byte[16];
+    this.random.nextBytes(requestId);
+    return Base64.getUrlEncoder().withoutPadding().encodeToString(requestId);
+  }
+
+  private record PendingRegistration(RegistrationStartResponse startResponse,
+      Long userId, ByteArray recoveryToken) {
   }
 
 }

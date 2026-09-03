@@ -6,6 +6,7 @@ import { FormField, FormRoot, form, required } from '@angular/forms/signals';
 import type { FieldTree, TreeValidationResult } from '@angular/forms/signals';
 import { RouterLink } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
+import { isExpectedCredentialError, isPasskeySupported } from '../passkey';
 
 type RegistrationView = 'new' | 'recover';
 
@@ -26,6 +27,8 @@ interface RecoveryRegistrationFormModel {
 export class RegistrationPage {
   readonly view = signal<RegistrationView>('new');
   readonly recoveryToken = signal<string | null>(null);
+  readonly recoveryCodeCopied = signal(false);
+  readonly passkeySupported = isPasskeySupported();
 
   readonly newRegistrationModel = signal<NewRegistrationFormModel>({ username: '' });
   readonly newRegistrationForm = form(
@@ -70,18 +73,37 @@ export class RegistrationPage {
     this.view.set(value);
   }
 
+  async copyRecoveryCode(): Promise<void> {
+    const token = this.recoveryToken();
+    if (!token) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(token);
+      this.recoveryCodeCopied.set(true);
+    } catch {
+      await this.messagesService.showErrorToast('Could not copy the recovery code');
+    }
+  }
+
   private async register(
     username: string | null,
     recovery: string | null,
     inputField: FieldTree<string>,
   ): Promise<TreeValidationResult> {
+    if (!this.passkeySupported) {
+      await this.messagesService.showErrorToast('Passkeys are not supported by this browser');
+      return { kind: 'passkeysUnsupported', message: 'Passkeys are not supported' };
+    }
+
     const loading = await this.messagesService.showLoading('Starting registration ...');
 
     let body = new HttpParams();
     if (username) {
-      body = body.set('username', username);
+      body = body.set('username', username.trim());
     } else if (recovery) {
-      body = body.set('recoveryToken', recovery);
+      body = body.set('recoveryToken', recovery.trim());
     }
 
     let response: RegistrationStartResponse;
@@ -99,6 +121,8 @@ export class RegistrationPage {
     if (response.status === 'OK') {
       if (this.isSuccessfulResponse(response)) {
         await this.createCredentials(response);
+      } else {
+        await this.messagesService.showErrorToast('The server returned an invalid response');
       }
       return undefined;
     }
@@ -117,6 +141,9 @@ export class RegistrationPage {
     if (status === 'TOKEN_INVALID') {
       return 'Recovery Code invalid';
     }
+    if (status === 'INVALID_REQUEST') {
+      return 'Invalid registration request';
+    }
     return 'Registration failed';
   }
 
@@ -134,7 +161,7 @@ export class RegistrationPage {
       }
       credential = cred.toJSON();
     } catch (error) {
-      if (!this.isExpectedCredentialError(error)) {
+      if (!isExpectedCredentialError(error)) {
         await this.messagesService.showErrorToast('Registration failed');
       }
       return;
@@ -163,14 +190,6 @@ export class RegistrationPage {
       await loading.dismiss();
     }
   }
-
-  private isExpectedCredentialError(error: unknown): boolean {
-    return (
-      error instanceof DOMException &&
-      (error.name === 'AbortError' || error.name === 'NotAllowedError')
-    );
-  }
-
   private isSuccessfulResponse(
     response: RegistrationStartResponse,
   ): response is SuccessfulRegistrationStartResponse {
@@ -183,7 +202,7 @@ export class RegistrationPage {
 }
 
 interface RegistrationStartResponse {
-  status: 'OK' | 'USERNAME_TAKEN' | 'TOKEN_INVALID';
+  status: 'OK' | 'USERNAME_TAKEN' | 'TOKEN_INVALID' | 'INVALID_REQUEST';
   registrationId?: string;
   publicKeyCredentialCreationOptions?: PublicKeyCredentialCreationOptionsJSON;
 }

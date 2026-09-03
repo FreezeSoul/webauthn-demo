@@ -18,9 +18,23 @@
         />
       </label>
 
-      <button (click)="signIn()" class="btn btn-primary btn-block" type="button">
+      <button
+        (click)="signIn()"
+        [disabled]="signingIn() || !passkeySupported"
+        class="btn btn-primary btn-block"
+        type="button"
+      >
+        @if (signingIn()) {
+          <span class="loading loading-spinner loading-sm"></span>
+        }
         Sign in with passkey
       </button>
+
+      @if (!passkeySupported) {
+        <div role="alert" class="alert alert-warning text-sm">
+          This browser does not expose the WebAuthn APIs required for passkeys.
+        </div>
+      }
 
       @if (conditionalMediationAvailable()) {
         <p class="text-center text-sm text-base-content/70">
